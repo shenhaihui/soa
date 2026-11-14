@@ -1,7 +1,7 @@
 """Experiment 4: Gamma arrivals, lognormal service, and free balking at Q > 20."""
 from pathlib import Path
 
-from experiment_revision import OUTPUT_ROOT, run_point, single_params
+from experiment_common import OUTPUT_ROOT, run_point, single_params
 from numerical import write_csv
 
 
@@ -10,9 +10,8 @@ def settings(pilot: bool = False) -> list[tuple[str, dict]]:
             "arrival_distribution": "gamma", "arrival_scv": 2.0,
             "service_distribution": "lognormal", "service_scv": 2.0,
             "initial_residual_distribution": "lognormal", "initial_residual_scv": 2.0,
-            "initial_residual_protocol": "artificial same-as-service residual; not equilibrium carryover",
-            "balk_threshold": 20, "balk_penalty": 0.0,
-            "qed_lookup_only": False}
+            "initial_residual_protocol": "same distribution as service times",
+            "balk_threshold": 20, "balk_penalty": 0.0}
     return [(f"initialization{count}", {**base, "initial_patient_count": count}) for count in (60, 120)]
 
 

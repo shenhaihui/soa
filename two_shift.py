@@ -15,12 +15,12 @@ import numpy as np
 
 from case_study import lru_put
 from formulas import qed_n1, qed_n2
-from numerical import build_rate_lookup, hill_climb, mean_ci, namespaced_seed, rate_lookup_n2, write_csv, write_json
-from simulation import build_model_stream, conditional_service_residual, service_samples, simulate_shift
+from numerical import hill_climb, mean_ci, namespaced_seed, write_csv, write_json
+from simulation import build_model_stream, service_samples, simulate_shift
 
 STAT_KEYS = ("des_calls", "des_cache_hits", "second_solves", "decision_cache_hits", "qos_cache_hits", "stream_cache_hits",
              "first_value_solves", "first_value_cache_hits", "shared_qos_cache_hits", "path_value_cache_hits", "cost_only_des_calls")
-METHODS = ("SEQ_REF", "COND_MEAN", "BIN_LOOKUP", "FULL_RATE_PATHWISE")
+METHODS = ("SEQ_REF", "COND_MEAN", "BIN_LOOKUP")
 _WORKER_CONTEXT: dict | None = None
 _EMPTY_STATE_KEY = hashlib.sha256(b"[]").digest()
 
@@ -36,11 +36,11 @@ def two_params(pilot: bool = True) -> dict[str, Any]:
         "M": 2 if pilot else 100, "J": 2 if pilot else 40, "R": 2 if pilot else 20,
         "K": 2 if pilot else 10, "path_replications": 2 if pilot else 20,
         "lookup_bins": 2 if pilot else 20,
+        "lookup_extra_paths": 2 if pilot else 900,
         "eval_scenarios": 2 if pilot else 100, "eval_replications": 2 if pilot else 100,
         "outer_rounds": 1, "inner_rounds": 2, "n2_upper_floor": 20,
         "seed_namespace": 2026102820 if pilot else 2026102821,
         "workers": max(1, (os.cpu_count() or 2) // 2), "cache_limit": 2000,
-        "accuracy_check": False,
     }
 
 
@@ -74,18 +74,20 @@ def conditional_rate(p: dict, known_shift: int, known_rate: float, rng: np.rando
 
 def observable_state(state: list[dict]) -> list[dict]:
     # Never expose latent residual service/patience or a pre-generated full service draw.
-    keys = ("priority", "arrival_rank", "has_started_service", "service_received", "wait_total", "wait_over_10min_counted")
+    keys = ("priority", "arrival_rank", "has_started_service", "wait_total", "wait_over_10min_counted")
     return [{key: row.get(key, False if key in ("has_started_service", "wait_over_10min_counted") else 0.0)
              for key in keys} for row in state]
 
 
 def conditional_state(p: dict, observed: list[dict], service_seed: int, patience_seed: int) -> list[dict]:
+    if p["service_distribution"] != "exponential":
+        raise ValueError("The two-shift sequential reference requires exponential service")
     services, patience = np.random.default_rng(service_seed), np.random.default_rng(patience_seed)
     result = []
     for row in observable_state(observed):
         patient = dict(row)
         if row["has_started_service"]:
-            patient["remaining_service_time"] = conditional_service_residual(services, p["mu"], p["service_distribution"], p["service_scv"], row["service_received"])
+            patient["remaining_service_time"] = float(services.exponential(1.0 / p["mu"]))
             patient["remaining_patience_time"] = None
         else:
             patient["service_time"] = float(service_samples(services, p["mu"], p["service_distribution"], p["service_scv"], 1)[0])
@@ -197,7 +199,7 @@ def shift_cost(p: dict, state: list[dict], capacity: int, lam: float, stage: int
         ctx["stream_cache_hits"] += 1
         ctx["streams"].move_to_end(stream_key)
     value = simulate_shift(state, capacity, 0, lam, p["mu"], p["theta"], 0, 0, p["h"], p["a"], 0,
-                           stream, strict_stream=True, track_service=need_state, cost_only=not need_state)
+                           stream, strict_stream=True, cost_only=not need_state)
     ctx["des_calls"] += 1
     ctx["cost_only_des_calls"] += int(not need_state)
     if need_state:
@@ -439,136 +441,109 @@ def auxiliary_task(task: tuple) -> dict:
     return task_result(ctx, n2=n2, cost=p["c1"] * sum(n1) + cost, shared_path=shared_path)
 
 
-def train_conditional_tables(p: dict, n1: list[int], rates: list[list[float]], training: list[dict],
-                             executor: Any | None) -> tuple[list[dict], list[dict], dict, list[dict]]:
-    points, anchors, results = [], [], []
-    tables = {"COND_MEAN": [], "BIN_LOOKUP": []}
-    for shift in range(2):
-        def point(sid: int, k: int, path: list[float], n2: list[int], cost: float) -> dict:
-            return {"source": "search" if k == 0 else "conditional", "shift": shift,
-                    "anchor_id": sid, "conditional_id": k, "scenario_id": sid * p["K"] + k,
-                    "lambda_fixed": path[shift], "lambda_1": path[0], "lambda_2": path[1],
-                    "n1": n1[shift], "n2": n2[shift], "n2_1": n2[0], "n2_2": n2[1],
-                    "objective_value": cost, "solver_stage": 31 if k == 0 else 52 + shift}
-
-        group = [point(sid, 0, path, training[sid]["n2"], training[sid]["cost"])
-                 for sid, path in enumerate(rates)]
-        tasks = []
-        for sid, path in enumerate(rates):
-            for k in range(1, p["K"]):
-                other = conditional_rate(p, shift, path[shift], np.random.default_rng(seed(p, 50 + shift, sid, k, 0, 10)))
-                completed = [path[0], other] if shift == 0 else [other, path[1]]
-                tasks.append((p, n1, completed, 52 + shift, sid, k))
-        added = progress_map(path_task, tasks, executor, f"offline conditional shift {shift + 1}")
-        results.extend(added)
-        for task, result in zip(tasks, added):
-            group.append(point(task[4], task[5], task[2], result["n2"], p["c1"] * sum(n1) + result["cost"]))
-        group.sort(key=lambda row: (row["anchor_id"], row["conditional_id"]))
-        points.extend(group)
-        for sid, path in enumerate(rates):
-            values = [row["n2"] for row in group if row["anchor_id"] == sid]
-            mean = float(np.mean(values))
-            anchors.append({"shift": shift, "anchor_id": sid, "lambda_fixed": path[shift], "n1": n1[shift],
-                            "source_count": len(values), "n2_mean": mean, "n2": int(math.floor(mean + 0.5))})
-        # Both tables average the same raw decisions, never already-rounded anchor means.
-        tables["COND_MEAN"].append(build_rate_lookup(group, len(rates)))
-        tables["BIN_LOOKUP"].append(build_rate_lookup(group, p["lookup_bins"]))
-    anchors.sort(key=lambda row: (row["shift"], row["lambda_fixed"], row["anchor_id"]))
-    return points, anchors, tables, results
+def sequential_task(task: tuple, executor: Any | None, ctx: dict) -> dict:
+    p, n1, rates, sid = task
+    check_context(p, ctx)
+    reset_diagnostics(ctx)
+    n2, cost = solve_first(p, n1, rates[0], 10, sid, ctx, executor)
+    return task_result(ctx, cost=p["c1"] * sum(n1) + cost, n2=[n2])
 
 
-def _task(task: tuple, executor: Any | None = None, ctx: dict | None = None) -> dict:
-    p, kind, n1, rates, sid = task
-    if ctx is None:
-        ctx = worker_context(p) if executor is None else context()
-    else:
-        check_context(p, ctx)
-        reset_diagnostics(ctx)
-    if kind == "seq":
-        result = solve_first(p, n1, rates[0], 10, sid, ctx, executor)
-        value = {"cost": p["c1"] * sum(n1) + result[1], "n2": [result[0]]}
-    else:
-        result = path_n2(p, n1, rates, 31 if kind == "aux" else 41, sid, 0, ctx)
-        value = {"cost": p["c1"] * sum(n1) + result[1], "n2": result[0]}
-    return task_result(ctx, **value)
+def replication_row(p: dict, n1: list[int], n2: list[int], outcomes: list[dict]) -> dict:
+    waiting, abandonment, queue, abandons, arrivals = (
+        sum(row[key] for row in outcomes)
+        for key in ("waiting_cost", "abandonment_cost", "queue_area", "abandon_count", "arrival_count"))
+    base, surge = p["c1"] * sum(n1), p["c2"] * sum(n2)
+    return {"total_cost": base + surge + waiting + abandonment, "base_cost": base, "surge_cost": surge,
+            "waiting_cost": waiting, "abandonment_cost": abandonment, "avg_queue": queue / 2,
+            "avg_wait_time": queue / arrivals if arrivals else 0, "lwbs_rate": abandons / arrivals if arrivals else 0,
+            "n2_1": n2[0], "n2_2": n2[1], "terminal_count": outcomes[-1]["terminal_count"]}
 
 
 def evaluate_replication(p: dict, method: str, n1: list[int], fixed_n2: list[int], rates: list[float], sid: int, rep: int, ctx: dict) -> dict:
-    state, n2, waiting, abandonment, queue, abandons, arrivals = [], [], 0.0, 0.0, 0.0, 0, 0
-    state_key = _EMPTY_STATE_KEY
-    decisions = []
-    worker_times = {"seq_second_decisions": 0.0, "execution": 0.0}
-    for shift in range(2):
-        begin = time.perf_counter()
-        if method == "SEQ_REF" and shift == 1:
-            decision = solve_second(p, n1, observable_state(state), rates[1], 23, sid, rep, ctx)[0]
-            worker_times["seq_second_decisions"] += time.perf_counter() - begin
-        else:
-            decision = fixed_n2[shift]
+    state, outcomes, decisions, state_key = [], [], [], _EMPTY_STATE_KEY
+    for shift, decision in enumerate(fixed_n2):
         decisions.append({"benchmark": method, "scenario_id": sid, "replication_id": rep, "shift": shift,
                           "lambda_fixed": rates[shift], "initial_patients": len(state), "n1": n1[shift], "n2": decision})
-        begin = time.perf_counter()
         result = shift_cost(p, state, n1[shift] + decision, rates[shift], 61, sid, 0, rep, shift, ctx, state_key)
-        worker_times["execution"] += time.perf_counter() - begin
         state, state_key = result["final_state"], result["_state_key"]
-        n2.append(decision)
-        waiting += result["waiting_cost"]
-        abandonment += result["abandonment_cost"]
-        queue += result["queue_area"]
-        abandons += result["abandon_count"]
-        arrivals += result["arrival_count"]
-    base, surge = p["c1"] * sum(n1), p["c2"] * sum(n2)
-    row = {"total_cost": base + surge + waiting + abandonment, "base_cost": base, "surge_cost": surge,
-           "waiting_cost": waiting, "abandonment_cost": abandonment, "avg_queue": queue / 2,
-           "avg_wait_time": queue / arrivals if arrivals else 0, "lwbs_rate": abandons / arrivals if arrivals else 0,
-           "n2_1": n2[0], "n2_2": n2[1], "terminal_count": len(state)}
-    return {"row": row, "decisions": decisions, "worker_time_sec": worker_times}
+        outcomes.append({**result, "terminal_count": len(state)})
+    return {"row": replication_row(p, n1, fixed_n2, outcomes), "decisions": decisions}
 
 
-def replication_task(task: tuple) -> dict:
-    ctx = worker_context(task[0])
-    return task_result(ctx, **evaluate_replication(*task, ctx))
+def first_decision_task(task: tuple, executor: Any | None) -> dict:
+    p, n1, lam, sid = task
+    ctx = context()
+    return task_result(ctx, n2=solve_first(p, n1, lam, 20, sid, ctx, executor)[0])
 
 
-def evaluate_scenario(task: tuple, executor: Any | None = None) -> dict:
-    p, n1_seq, n1_aux, tables, rates, sid = task
-    ctx = worker_context(p) if executor is None else context()
-    rows, decisions = [], []
-    begin = time.perf_counter()
-    first_n2 = solve_first(p, n1_seq, rates[0], 20, sid, ctx, executor)[0]
-    worker_times = {"seq_first_decision": time.perf_counter() - begin, "seq_second_decisions": 0.0, "execution": 0.0}
-    begin = time.perf_counter()
-    offline_vectors = {method: [rate_lookup_n2(tables[method][i], rates[i]) for i in range(2)]
-                       for method in ("COND_MEAN", "BIN_LOOKUP")}
-    worker_times["offline_lookup_queries"] = time.perf_counter() - begin
-    begin = time.perf_counter()
-    # Full-rate information, but no execution samples or realized carry-over feedback.
-    task = (p, n1_aux, rates, 54, sid, 0)
-    if executor is None:
-        full_rate = path_n2(*task, ctx)[0]
-    else:
-        result = executor.submit(path_task, task).result()
-        merge_results(ctx, [result])
-        full_rate = result["n2"]
-    worker_times["full_rate_pathwise_queries"] = time.perf_counter() - begin
-    fixed_vectors = {"SEQ_REF": [first_n2, 0], **offline_vectors, "FULL_RATE_PATHWISE": full_rate}
-    for method in METHODS:
-        n1 = n1_seq if method == "SEQ_REF" else n1_aux
-        fixed = fixed_vectors[method]
-        tasks = [(p, method, n1, fixed, rates, sid, rep) for rep in range(p["eval_replications"])]
-        if executor is None:
-            results = [evaluate_replication(*args, ctx) for args in tasks]
-        else:
-            results = list(executor.map(replication_task, tasks))
-            merge_results(ctx, results)
-        rep_rows = [row["row"] for row in results]
-        for result in results:
-            decisions.extend(result["decisions"])
-            for key, seconds in result["worker_time_sec"].items():
-                worker_times[key] += seconds
-        rows.append({"benchmark": method, "scenario_id": sid, "lambda_1": rates[0], "lambda_2": rates[1], "n1_vec": str(n1),
-                     **{key: float(np.mean([row[key] for row in rep_rows])) for key in rep_rows[0]}})
-    return task_result(ctx, rows=rows, decisions=decisions, worker_time_sec=worker_times)
+def second_decision_task(task: tuple) -> dict:
+    p, n1, observed, lam, sid, rep = task
+    ctx = worker_context(p)
+    return task_result(ctx, n2=solve_second(p, n1, observed, lam, 23, sid, rep, ctx)[0])
+
+
+def execution_task(task: tuple) -> dict:
+    p, state, capacity, lam, sid, rep, shift = task
+    ctx = worker_context(p)
+    result = shift_cost(p, state, capacity, lam, 61, sid, 0, rep, shift, ctx)
+    value = {key: result[key] for key in ("waiting_cost", "abandonment_cost", "queue_area", "abandon_count", "arrival_count")}
+    value["terminal_count"] = len(result["final_state"])
+    if shift == 0:
+        value["final_state"] = result["final_state"]
+    return task_result(ctx, value=value)
+
+
+def evaluate_sequential(p: dict, n1: list[int], rates: list[list[float]], use_parallel: bool) -> dict:
+    # Separate decision batches from actual execution to measure wall time without solving twice.
+    init_worker()
+    executor = ProcessPoolExecutor(max_workers=p["workers"], initializer=init_worker) if use_parallel else None
+    coordinators = ThreadPoolExecutor(max_workers=p["workers"]) if use_parallel else None
+    timings, ctx = {}, context()
+    pairs = [(sid, rep) for sid in range(len(rates)) for rep in range(p["eval_replications"])]
+    try:
+        tasks = [(p, n1, path[0], sid) for sid, path in enumerate(rates)]
+        begin = time.perf_counter()
+        first = progress_map(lambda task: first_decision_task(task, executor), tasks, coordinators, "OPT online shift 1")
+        timings["online_first_shift"] = time.perf_counter() - begin
+
+        tasks = [(p, [], n1[0] + first[sid]["n2"], rates[sid][0], sid, rep, 0) for sid, rep in pairs]
+        begin = time.perf_counter()
+        first_runs = progress_map(execution_task, tasks, executor, "OPT execution shift 1")
+        timings["first_shift_execution"] = time.perf_counter() - begin
+
+        tasks = [(p, n1, observable_state(run["value"]["final_state"]), rates[sid][1], sid, rep)
+                 for (sid, rep), run in zip(pairs, first_runs)]
+        begin = time.perf_counter()
+        second = progress_map(second_decision_task, tasks, executor, "OPT online shift 2")
+        timings["online_second_shift"] = time.perf_counter() - begin
+
+        # Execute with the actual residuals, not the conditional samples used to choose N2.
+        tasks = [(p, run["value"]["final_state"], n1[1] + decision["n2"], rates[sid][1], sid, rep, 1)
+                 for (sid, rep), run, decision in zip(pairs, first_runs, second)]
+        begin = time.perf_counter()
+        second_runs = progress_map(execution_task, tasks, executor, "OPT execution shift 2")
+        timings["second_shift_execution"] = time.perf_counter() - begin
+    finally:
+        if coordinators is not None:
+            coordinators.shutdown()
+        if executor is not None:
+            executor.shutdown()
+    timings["online_total"] = timings["online_first_shift"] + timings["online_second_shift"]
+    merge_results(ctx, first + first_runs + second + second_runs)
+    rep_rows, decisions = [], []
+    for (sid, rep), a, b, decision in zip(pairs, first_runs, second_runs, second):
+        n2 = [first[sid]["n2"], decision["n2"]]
+        rep_rows.append(replication_row(p, n1, n2, [a["value"], b["value"]]))
+        decisions.extend({"benchmark": "SEQ_REF", "scenario_id": sid, "replication_id": rep, "shift": shift,
+                          "lambda_fixed": rates[sid][shift], "initial_patients": 0 if shift == 0 else a["value"]["terminal_count"],
+                          "n1": n1[shift], "n2": n2[shift]} for shift in range(2))
+    rows = []
+    for sid, path in enumerate(rates):
+        group = rep_rows[sid * p["eval_replications"]:(sid + 1) * p["eval_replications"]]
+        rows.append({"benchmark": "SEQ_REF", "scenario_id": sid, "lambda_1": path[0], "lambda_2": path[1], "n1_vec": str(n1),
+                     **{key: float(np.mean([row[key] for row in group])) for key in group[0]}})
+    return task_result(ctx, rows=rows, decisions=decisions, timings_sec=timings)
 
 
 def paired_cost_rows(rows: list[dict], comparisons: tuple[tuple[str, str, str], ...]) -> list[dict]:
@@ -587,24 +562,31 @@ def paired_cost_rows(rows: list[dict], comparisons: tuple[tuple[str, str, str], 
     return result
 
 
-def gap_rows(rows: list[dict]) -> list[dict]:
-    result = paired_cost_rows(rows, (("offline_policy_gap", "COND_MEAN", "SEQ_REF"),
-                                    ("coarsening_gap", "BIN_LOOKUP", "COND_MEAN"),
-                                    ("total_gap", "BIN_LOOKUP", "SEQ_REF")))
-    assert math.isclose(result[0]["mean_cost_difference"] + result[1]["mean_cost_difference"], result[2]["mean_cost_difference"], abs_tol=1e-9)
-    return result
-
-
-def run_two(output: Path, p: dict | None = None, use_parallel: bool = True) -> dict:
-    p = dict(two_params() if p is None else p)
+def train_two(output: Path, p: dict, use_parallel: bool = True) -> dict:
+    p = dict(p)
     if abs(p["rho"]) >= 1 or p["sigma"] <= 0 or p["initialization"] != "empty" or p["renewal_boundary"] != "restart_each_shift":
         raise ValueError("Two-shift solver requires empty start, positive variance, |rho|<1 and restarting renewal clocks")
     if min(p[key] for key in ("M", "J", "R", "K", "path_replications", "eval_scenarios", "eval_replications")) < 1:
         raise ValueError("All sampling budgets must be positive")
-    if not 1 <= p["lookup_bins"] <= p["M"]:
-        raise ValueError("Lookup bins must be between one and the number of training rate anchors")
+    if not 1 <= p["lookup_bins"] <= p["M"] + p["lookup_extra_paths"]:
+        raise ValueError("Lookup bins must fit within the final joint-path training set")
     if p["c2"] <= 0 or min(p["h"], p["a"]) < 0 or min(p["outer_rounds"], p["inner_rounds"]) < 1:
         raise ValueError("Search requires positive surge cost/round counts and nonnegative QoS costs")
+    source = Path(__file__).resolve().parent
+    signature = json.loads(json.dumps({"config": {k: v for k, v in p.items() if k != "workers"},
+        "source": {name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+                   for name in ("two_shift.py", "case_study.py", "numerical.py", "simulation.py", "formulas.py")}}))
+    config = output / "run_config.json"
+    required = ("summary.json", "benchmark_table.csv", "scenario_costs.csv", "policy_decisions.csv",
+                "policy_information.json", "online_timing.csv", "search_paths.csv", "search_results.json", "search_trace.csv")
+    if output.exists() and any(output.iterdir()):
+        if not config.is_file() or json.loads(config.read_text()) != signature:
+            raise ValueError(f"Existing two-shift training has different parameters/source: {output}")
+        if (output / "run_complete.json").is_file() and all((output / name).is_file() for name in required):
+            print(f"[Two shift] SKIP completed training {output}", flush=True)
+            return json.loads((output / "summary.json").read_text())
+    write_json(config, signature)
+    (output / "run_complete.json").unlink(missing_ok=True)
     started, timings, task_results, traces = time.perf_counter(), {}, [], []
     output.mkdir(parents=True, exist_ok=True)
     rates = [joint_rate(p, np.random.default_rng(seed(p, 1, sid, stream=10))) for sid in range(p["M"])]
@@ -631,9 +613,9 @@ def run_two(output: Path, p: dict | None = None, use_parallel: bool = True) -> d
                     query_begin = time.perf_counter()
                     label = f"{kind} candidate {len(memo) + 1}, N1={n1}"
                     print(f"[Two shift] START {label}", flush=True)
-                    tasks = [(p, kind, n1, path, sid) for sid, path in enumerate(rates)]
                     if kind == "seq":
-                        result = progress_map(lambda task: _task(task, executor, scenario_contexts[task[-1]]), tasks, coordinators, label)
+                        tasks = [(p, n1, path, sid) for sid, path in enumerate(rates)]
+                        result = progress_map(lambda task: sequential_task(task, executor, scenario_contexts[task[-1]]), tasks, coordinators, label)
                     else:
                         aux_tasks = [(p, n1, path, sid, path_tables[sid]) for sid, path in enumerate(rates)]
                         result = progress_map(auxiliary_task, aux_tasks, executor, label)
@@ -663,109 +645,67 @@ def run_two(output: Path, p: dict | None = None, use_parallel: bool = True) -> d
             write_csv(output / "search_trace.csv", traces)
             write_json(output / "search_results.json", {"config": p, "search": searches, "timings_sec": timings})
             print(f"[Two shift] {kind}: N1={n1}, objective={cost:.4f}, elapsed={timings[f'search_{kind}']:.1f}s", flush=True)
-        begin = time.perf_counter()
-        print(f"[Two shift] START offline training: reuse {len(rates)} paths, "
-              f"solve {2 * len(rates) * (p['K'] - 1)} conditional paths", flush=True)
-        points, anchors, tables, results = train_conditional_tables(p, selected["aux"], rates, training, executor)
-        task_results.extend(results)
-        timings["offline_training"] = time.perf_counter() - begin
-        offline_training = {"anchors_per_shift": len(rates), "paths_per_anchor": p["K"],
-                            "reused_unique_paths": len(rates), "additional_path_solves": len(results),
-                            "point_count": len(points), "fine_requested_bins": len(rates), "coarse_requested_bins": p["lookup_bins"],
-                            "fine_intervals": [len(table) for table in tables["COND_MEAN"]],
-                            "coarse_intervals": [len(table) for table in tables["BIN_LOOKUP"]]}
-        write_csv(output / "lookup_points.csv", points)
-        write_csv(output / "conditional_mean_points.csv", anchors)
-        for method, name in (("COND_MEAN", "conditional_mean_lookup.csv"), ("BIN_LOOKUP", "lookup.csv")):
-            write_csv(output / name, [{"shift": i, "n1": selected["aux"][i], **row}
-                                     for i, table in enumerate(tables[method]) for row in table])
-        print(f"[Two shift] offline tables saved, elapsed={timings['offline_training']:.1f}s", flush=True)
-        begin = time.perf_counter()
-        evl = [joint_rate(p, np.random.default_rng(seed(p, 60, sid, stream=10))) for sid in range(p["eval_scenarios"])]
-        print("[Two shift] START independent evaluation", flush=True)
-        results = progress_map(lambda task: evaluate_scenario(task, executor),
-                               [(p, selected["seq"], selected["aux"], tables, path, sid) for sid, path in enumerate(evl)],
-                               coordinators, "evaluation scenarios")
-        task_results.extend(results)
-        rows = [row for result in results for row in result["rows"]]
-        decisions = [row for result in results for row in result["decisions"]]
-        evaluation_worker_time = {key: sum(result["worker_time_sec"][key] for result in results) for key in results[0]["worker_time_sec"]}
-        timings["independent_evaluation"] = time.perf_counter() - begin
-        bench = []
-        for label in METHODS:
-            group = [r for r in rows if r["benchmark"] == label]
-            mean, low, high = mean_ci([r["total_cost"] for r in group])
-            bench.append({"benchmark": label, "n1_vec": group[0]["n1_vec"], "mean_total_cost": mean, "ci95_lower": low, "ci95_upper": high,
-                          **{f"mean_{key}": float(np.mean([r[key] for r in group])) for key in ("base_cost", "surge_cost", "waiting_cost", "abandonment_cost", "avg_queue", "avg_wait_time", "lwbs_rate", "n2_1", "n2_2")}})
-        # Persist the main results before any optional accuracy diagnostic.
-        write_csv(output / "benchmark_table.csv", bench)
-        write_csv(output / "scenario_costs.csv", rows)
-        write_csv(output / "policy_decisions.csv", decisions)
-        gaps = gap_rows(rows)
-        write_csv(output / "approximation_gap_decomposition.csv", gaps)
-        full_rate_pairs = paired_cost_rows(rows, (("full_rate_vs_seq", "FULL_RATE_PATHWISE", "SEQ_REF"),
-                                                 ("full_rate_vs_cond_mean", "FULL_RATE_PATHWISE", "COND_MEAN"),
-                                                 ("full_rate_vs_lookup", "FULL_RATE_PATHWISE", "BIN_LOOKUP")))
-        write_csv(output / "paired_comparison.csv", [{**row, "mean_saving": -row["mean_cost_difference"], "saving_ci_lower": -row["ci95_upper"], "saving_ci_upper": -row["ci95_lower"]} for row in [*gaps, *full_rate_pairs]])
-        print("[Two shift] main evaluation tables saved", flush=True)
-        accuracy = {"status": "disabled", "global_optimality_claim": False}
-        accuracy_results = []
-        if p["accuracy_check"]:
-            begin = time.perf_counter()
-            print("[Two shift] START doubled-budget diagnostic (fixed N1)", flush=True)
-            doubled = {**p, **{key: 2 * p[key] for key in ("M", "J", "R", "path_replications")}}
-            doubled_rates = [joint_rate(p, np.random.default_rng(seed(p, 1, sid, stream=10))) for sid in range(doubled["M"])]
-            higher = progress_map(lambda task: _task(task, executor),
-                                  [(doubled, "seq", selected["seq"], path, sid) for sid, path in enumerate(doubled_rates)],
-                                  coordinators, "accuracy scenarios")
-            check = progress_map(lambda task: evaluate_scenario(task, executor),
-                                 [(doubled, selected["seq"], selected["aux"], tables, evl[0], 0)],
-                                 coordinators, "accuracy evaluation probe")[0]
-            accuracy_results = [*higher, check]
-            accuracy = {"status": "diagnostic only; precision is not certified", "fixed_n1": selected,
-                        "baseline_budgets": {key: p[key] for key in ("M", "J", "R", "path_replications")},
-                        "doubled_budgets": {key: doubled[key] for key in ("M", "J", "R", "path_replications")},
-                        "seq_objective_before": searches["seq"]["objective"], "seq_objective_doubled": float(np.mean([r["cost"] for r in higher])),
-                        "evaluation_probe_before": results[0]["rows"], "evaluation_probe_doubled": check["rows"],
-                        "note": "Fixed selected N1 and both offline tables; one common execution path probes sequential/full-rate decision changes. Offline training K is not doubled. Not a reoptimized accuracy study."}
-            timings["accuracy_diagnostic"] = time.perf_counter() - begin
-        else:
-            print("[Two shift] doubled-budget diagnostic disabled", flush=True)
+        write_csv(output / "search_paths.csv", [
+            {"source": "search", "scenario_id": sid, "lambda_1": path[0], "lambda_2": path[1],
+             "n1_vec": str(selected["aux"]), "n2_1": training[sid]["n2"][0],
+             "n2_2": training[sid]["n2"][1], "objective_value": training[sid]["cost"], "solver_stage": 31}
+            for sid, path in enumerate(rates)])
     finally:
         if coordinators is not None:
             coordinators.shutdown()
         if executor is not None:
             executor.shutdown()
+    evl = [joint_rate(p, np.random.default_rng(seed(p, 60, sid, stream=10))) for sid in range(p["eval_scenarios"])]
+    begin = time.perf_counter()
+    print("[Two shift] START OPT independent evaluation with fresh caches", flush=True)
+    evaluation = evaluate_sequential(p, selected["seq"], evl, use_parallel)
+    timings.update(evaluation["timings_sec"])
+    timings["independent_evaluation"] = time.perf_counter() - begin
+    task_results.append(evaluation)
+    rows = evaluation["rows"]
+    mean, low, high = mean_ci([r["total_cost"] for r in rows])
+    bench = [{"benchmark": "SEQ_REF", "n1_vec": str(selected["seq"]), "mean_total_cost": mean,
+              "ci95_lower": low, "ci95_upper": high,
+              **{f"mean_{key}": float(np.mean([r[key] for r in rows])) for key in
+                 ("base_cost", "surge_cost", "waiting_cost", "abandonment_cost", "avg_queue", "avg_wait_time", "lwbs_rate", "n2_1", "n2_2")}}]
+    write_csv(output / "benchmark_table.csv", bench)
+    write_csv(output / "scenario_costs.csv", rows)
+    write_csv(output / "policy_decisions.csv", evaluation["decisions"])
+    write_csv(output / "online_timing.csv", [
+        {"benchmark": "SEQ_REF", "phase": phase, "elapsed_sec": timings[phase], "decision_count": count}
+        for phase, count in (("online_first_shift", len(evl)),
+                             ("online_second_shift", len(evl) * p["eval_replications"]),
+                             ("online_total", len(evl) * (1 + p["eval_replications"])))])
+    print("[Two shift] OPT evaluation and online timing saved", flush=True)
     queries = [row for result in task_results for row in result["queries"]]
     stats = {key: sum(result["stats"][key] for result in task_results) for key in task_results[0]["stats"]}
     write_csv(output / "decision_queries.csv", queries)
-    if accuracy_results:
-        write_csv(output / "accuracy_decision_queries.csv", [row for result in accuracy_results for row in result["queries"]])
     write_csv(output / "boundary_diagnostics.csv", [{"kind": kind, "decision_count": len(group), "upper_hits": sum(r["upper_hit"] for r in group),
                                                     "upper_hit_rate": float(np.mean([r["upper_hit"] for r in group])),
                                                     "initial_upper_hits": sum(r["initial_upper_hit"] for r in group),
                                                     "expanded_queries": sum(r["upper_expansions"] > 0 for r in group),
                                                     "total_upper_expansions": sum(r["upper_expansions"] for r in group)}
                                                    for kind in dict.fromkeys(r["kind"] for r in queries) if (group := [r for r in queries if r["kind"] == kind])])
-    write_json(output / "reference_accuracy.json", accuracy)
     write_json(output / "policy_information.json", {
         "SEQ_REF": "First: current rate and empty state. Second: current rate and observable own state; no latent residuals.",
-        "COND_MEAN": "Offline grid conditional mean. Each training rate anchors K paths: one reused auxiliary-search path and K-1 conditional draws. Average the target shift's raw N2, then round. Query midpoint intervals (lower interval at an exact midpoint); use endpoint decisions outside the anchor range for positive rates. No online optimization.",
-        "BIN_LOOKUP": "Same auxiliary N1 and raw offline samples as COND_MEAN. Equal-count groups of anchors average raw N2 before rounding; no interpolation or online optimization. Adjacent equal decisions may be merged in both tables.",
-        "FULL_RATE_PATHWISE": "Same auxiliary N1 as COND_MEAN/BIN_LOOKUP. Observes both rates before the first shift; optimizes a fixed N2 vector on independent stage-54 streams, then executes it on common stage-61 evaluation streams without state feedback. Not an implementable online policy or a guaranteed lower bound on SEQ_REF.",
         "conditional_state": "Service residuals follow the configured law conditional on received service; exponential service and patience are memoryless. Actual execution residuals are preserved.",
         "arrival_clock": "Ordinary renewal interval restarts each shift; actual service/patience residuals persist.",
         "sampling": "J paired state-rate branches, not J squared. All candidate first-shift capacities regenerate their own states.",
-        "seeds": "Stages 1,10-12,20-23,31,50-54,60-61 are distinct. Offline anchors use stage-1 training rates; added conditional draws use 50/51 and path solves 52/53. Evaluation rates/execution use 60/61 and never train the tables. Within-stage stream IDs separate rates, service and patience.",
-        "paired_statistics": "Scenario-paired differences are left minus right; mean_saving is right minus left. offline_policy_gap=COND_MEAN-SEQ_REF includes auxiliary N1, conditional averaging, sampling and grid approximation; it is not a pure model gap. coarsening_gap=BIN_LOOKUP-COND_MEAN uses identical training samples. Their sum is total_gap. Full-rate comparisons are separate. Negative values are retained.",
+        "seeds": "Training rates use stage 1; sequential searches use 10-12/20-23; auxiliary searches use 31; evaluation rates/execution use 60/61. Within-stage stream IDs separate rates, service and patience.",
+        "paired_statistics": "Scenario-paired differences are left minus right; mean_saving is right minus left. Negative values are retained.",
         "solver": "N1 has fixed bounds. N2 starts from QED; a binding upper bound is doubled using unchanged samples until the solution is interior. The same rule applies to SEQ and B/C pathwise solvers; no global-optimality certificate.",
     })
     timings["total"] = time.perf_counter() - started
-    summary = {"config": p, "search": searches, "offline_training": offline_training,
+    summary = {"config": p, "search": searches,
                "benchmarks": {r["benchmark"]: r for r in bench}, "timings_sec": timings,
-               "evaluation_worker_time_sec": evaluation_worker_time,
-               "timing_note": "Initial-N1 objective time is included in search time. offline_training builds both tables once. Evaluation first-decision/offline-lookup/full-rate query times sum coordinator elapsed time (including queue waits); execution/second-decision times sum worker elapsed time. They are not total wall-clock time. Bounded worker caches and per-scenario coordinator first-capacity/second-QoS/path-QoS caches persist across N1 candidates; scheduling changes worker cache counts, not decisions. Terminal search simulations compute costs only; actual evaluation retains all metrics and final states.",
-               "simulation_counts": stats, "accuracy_status": accuracy["status"],
-               "accuracy_simulation_counts": {key: sum(result["stats"][key] for result in accuracy_results) for key in stats}}
+               "timing_note": "Initial-N1 objective time is included in search time. OPT online time sums the two non-overlapping decision-batch wall times, not worker times or per-decision latency. Actual execution, task preparation and pool shutdown are excluded; dispatch, result collection and lazy worker startup inside each decision batch are included. Evaluation starts with fresh caches and retains them within OPT. Each online decision is solved once and then executed on independent stage-61 streams; actual residuals carry over unchanged.",
+               "simulation_counts": stats}
     write_json(output / "summary.json", summary)
+    write_json(output / "run_complete.json", signature)
     return summary
+
+
+def run_two(output: Path, p: dict | None = None, use_parallel: bool = True) -> dict:
+    from two_shift_policies import run_pipeline
+
+    return run_pipeline(output, dict(two_params() if p is None else p), use_parallel)

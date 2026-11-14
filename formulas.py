@@ -7,6 +7,13 @@ from scipy.optimize import minimize_scalar
 from scipy.stats import norm
 
 
+def round_half_up(value: float, digits: int = 0) -> int | float:
+    """Use floor(scaled value + 0.5), with halfway ties toward positive infinity."""
+    scale = 10 ** digits
+    rounded = math.floor(float(value) * scale + 0.5)
+    return rounded if digits == 0 else rounded / scale
+
+
 def hazard_rate(x: float) -> float:
     log_survival = float(norm.logsf(float(x)))
     if not math.isfinite(log_survival):
@@ -53,13 +60,13 @@ def base_staffing(lambda_mean: float, mu: float, alpha: float, beta: float, eta:
 def newsvendor_n1(lambda_mean: float, c1: float, h: float, mu: float, theta: float, a: float, sigma: float, alpha: float) -> int:
     load = float(lambda_mean) / float(mu)
     beta = beta_newsvendor(c1, h, mu, theta, a, sigma)
-    return max(1, int(round(load + beta * load ** float(alpha))))
+    return max(1, int(round_half_up(load + beta * load ** float(alpha))))
 
 
 def qed_n1(lambda_mean: float, c1: float, c2: float, h: float, mu: float, theta: float, a: float, sigma: float, alpha: float) -> int:
     beta = beta_star(c1, c2, sigma)
     eta = eta_star(h, mu, theta, a, c2)
-    return max(1, int(round(base_staffing(lambda_mean, mu, alpha, beta, eta))))
+    return max(1, int(round_half_up(base_staffing(lambda_mean, mu, alpha, beta, eta))))
 
 
 def qed_n2(lambda_fixed: float, n1_qed: int, h: float, mu: float, theta: float, a: float, c2: float) -> int:
@@ -67,7 +74,7 @@ def qed_n2(lambda_fixed: float, n1_qed: int, h: float, mu: float, theta: float, 
         return 0
     load = float(lambda_fixed) / float(mu)
     target = load + eta_star(h, mu, theta, a, c2) * math.sqrt(load)
-    return max(0, int(round(target)) - int(n1_qed))
+    return max(0, int(round_half_up(target)) - int(n1_qed))
 
 
 def mmk_queue(lambda_fixed: float, mu: float, theta: float, servers: int, tol: float = 1e-10, max_iter: int = 10000) -> float:
@@ -107,7 +114,7 @@ def mmk_queue(lambda_fixed: float, mu: float, theta: float, servers: int, tol: f
 def adjusted_n1_vec(lambda_means: tuple[float, ...], n1_qed: list[int], mu: float, theta: float, xi1: float) -> list[int]:
     qbars = [mmk_queue(float(lam), mu, theta, int(n1)) for lam, n1 in zip(lambda_means, n1_qed)]
     return [
-        max(1, int(round(int(n1_qed[i]) + float(xi1) * (qbars[(i - 1) % len(qbars)] - qbars[i]))))
+        max(1, int(round_half_up(int(n1_qed[i]) + float(xi1) * (qbars[(i - 1) % len(qbars)] - qbars[i]))))
         for i in range(len(n1_qed))
     ]
 
@@ -117,4 +124,4 @@ def adjusted_n2(lambda_fixed: float, n1_adj: int, n1_qed: int, state_size: int, 
     baseline = int(n1_adj) + int(base_n2)
     qbar = mmk_queue(lambda_fixed, mu, theta, baseline)
     excess = max(0, int(state_size) - baseline)
-    return max(0, int(round(base_n2 + float(xi2) * (excess - qbar))))
+    return max(0, int(round_half_up(base_n2 + float(xi2) * (excess - qbar))))

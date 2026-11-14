@@ -1,19 +1,23 @@
-"""Experiment 6: empty-start 14-shift Case, baseline plus six demand settings."""
+"""Experiment 6: empty-start 14-shift Case and six-setting sensitivity analysis."""
 import json
 from pathlib import Path
 
 from case_study import case_sensitivity_row
-from experiment_revision import OUTPUT_ROOT, case_settings, run_point
+from experiment_common import OUTPUT_ROOT, case_settings, run_point
 from numerical import write_csv
 
-# Use (0.3,) or (0.0,) to split the six settings between two devices.
+# With BASELINE_ONLY=False, RHOS can split the six settings between two devices.
 RHOS = (0.3, 0.0)
+BASELINE_ONLY = False
+OUTPUT = OUTPUT_ROOT / "experiment6"
 
 
-def run(output: Path = OUTPUT_ROOT / "experiment6", use_parallel: bool = True,
-        pilot: bool = False, rhos: tuple[float, ...] = RHOS) -> list[dict]:
+def run(output: Path = OUTPUT, use_parallel: bool = True,
+        pilot: bool = False, rhos: tuple[float, ...] = RHOS,
+        baseline_only: bool = BASELINE_ONLY) -> list[dict]:
     summaries = []
-    for name, p in case_settings(pilot, rhos):
+    points = case_settings(pilot, (0.3,))[:1] if baseline_only else case_settings(pilot, rhos)
+    for name, p in points:
         summary = run_point(output / name, p, "case", "test" if pilot else "formal", use_parallel)
         summaries.append(summary)
         rows = []

@@ -20,14 +20,17 @@ COLORS = {
     "JSO": "#c7a095",
 }
 POLICY_LABELS = {
-    "1,NV": r"$\pi_{1,NV}$",
-    "1,SO": r"$\pi_{1,SO}$",
-    "2,QED": r"$\pi_{2,QED}$",
-    "2,SO": r"$\pi_{2,SO}$",
-    "2,SO-Direct": r"$\pi_{2,SO}^{\mathrm{Direct}}$",
-    "2,SO-Lookup": r"$\pi_{2,SO}^{\mathrm{Lookup}}$",
-    "QED-N1+SO-N2": r"$\pi_{\mathrm{QED+SO}}$",
-    "JSO": r"$\pi_{JSO}$",
+    "1,NV": r"$\mathcal{P}_{1,\mathrm{NV}}$",
+    "1,SO": r"$\mathcal{P}_{1,\mathrm{SOA}}$",
+    "2,QED": r"$\mathcal{P}_{2,\mathrm{QED}}$",
+    "2,SO": r"$\mathcal{P}_{2,\mathrm{SOA}}$-D",
+    "2,SO-Direct": r"$\mathcal{P}_{2,\mathrm{SOA}}$-D",
+    "2,SO-Lookup": r"$\mathcal{P}_{2,\mathrm{SOA}}$",
+    "QED-N1+SO-N2": r"$\mathcal{P}_{\mathrm{QED+SOA}}$",
+    "JSO": r"$\mathcal{P}_{2,\mathrm{SOA}}$",
+    "SEQ_REF": r"$\mathcal{P}_{2,\mathrm{OPT}}$",
+    "COND_MEAN": r"$\mathcal{P}_{2,\mathrm{SOA}}$-D",
+    "BIN_LOOKUP": r"$\mathcal{P}_{2,\mathrm{SOA}}$",
 }
 
 
@@ -44,19 +47,38 @@ def save_cost_decomposition(rows: list[dict[str, object]], output: Path, scale: 
         ("mean_surge_cost", "Surge Cost"),
         ("mean_qos_cost", "QoS Cost"),
     ]
-    fig, axes = plt.subplots(1, 4, figsize=(16, 3.5) if len(names) > 5 else (12, 3.2))
-    for ax, (key, title) in zip(axes, metrics):
-        vals = [float(row[key] if key != "mean_qos_cost" or key in row else float(row["mean_waiting_cost"]) + float(row["mean_abandonment_cost"])) / scale for row in rows]
-        ax.bar(labels, vals, color=[COLORS.get(name, "#777777") for name in names], edgecolor="black", linewidth=0.8)
-        ax.set_title(title, fontsize=10)
-        ax.tick_params(axis="x", labelrotation=0, labelsize=8)
-        for idx, val in enumerate(vals):
-            ax.text(idx, val, f"{val:.1f}" if scale != 1.0 else f"{val:.2f}", ha="center", va="bottom", fontsize=7)
-    axes[0].set_ylabel("Average Cost" if scale == 1.0 else "Average Cost (thousand)")
-    fig.tight_layout()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=200)
-    plt.close(fig)
+    style = {
+        "font.family": "serif", "font.serif": ["cmr10"], "mathtext.fontset": "cm",
+        "axes.formatter.use_mathtext": True, "axes.linewidth": 0.6,
+        "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+    }
+    with plt.rc_context(style):
+        fig, axes = plt.subplots(1, 4, figsize=(max(6.5, 1.625 * len(names)), 2.55))
+        fig.subplots_adjust(left=0.10, right=0.995, bottom=0.22, top=0.86, wspace=0.32)
+        for ax, (key, title) in zip(axes, metrics):
+            vals = [float(row[key] if key != "mean_qos_cost" or key in row else float(row["mean_waiting_cost"]) + float(row["mean_abandonment_cost"])) / scale for row in rows]
+            bars = ax.bar(range(len(names)), vals, color=[COLORS.get(name, "#777777") for name in names],
+                          edgecolor="black", linewidth=0.6, width=0.8)
+            if ax is axes[0]:
+                handles = bars
+            ax.set_xticks([])
+            ax.set_title(title, fontsize=10, pad=6)
+            ax.tick_params(axis="both", labelsize=8.5, length=3, pad=2)
+            ax.margins(y=0.25 if key == "mean_base_cost" else 0.18)
+            for idx, (bar, val) in enumerate(zip(bars, vals)):
+                vertical = (11, 3, 3, 7)[idx] if key == "mean_base_cost" and len(names) == 4 else 3
+                center = bar.get_x() + bar.get_width() / 2
+                ax.annotate(f"{val:.1f}" if scale != 1.0 else f"{val:.2f}", (center, val),
+                            xytext=(0, vertical), textcoords="offset points",
+                            ha="center", va="bottom", fontsize=8)
+        axes[0].set_ylabel("Average Cost" if scale == 1.0 else "Average Cost (thousand)",
+                           fontsize=9, labelpad=4)
+        fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.55, 0.015),
+                   ncol=len(names), frameon=False, fontsize=9, handlelength=1.1,
+                   handletextpad=0.5, columnspacing=1.7)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=400)
+        plt.close(fig)
 
 
 def save_qos_ecdf(rows: list[dict[str, object]], output: Path) -> None:
@@ -65,7 +87,7 @@ def save_qos_ecdf(rows: list[dict[str, object]], output: Path) -> None:
         ("avg_wait_time", "Average Waiting Time", "Average Waiting Time"),
         ("lwbs_rate", "LWBS Rate (%)", "LWBS Rate (%)"),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2), sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), sharey=True)
     labels = list(dict.fromkeys(str(row["benchmark"]) for row in rows))
     for ax, (key, title, xlabel) in zip(axes, metrics):
         for label in labels:
@@ -74,67 +96,33 @@ def save_qos_ecdf(rows: list[dict[str, object]], output: Path) -> None:
                 continue
             y = np.arange(1, len(vals) + 1) / len(vals)
             ax.step(vals, y, where="post", label=policy_label(label), color=COLORS[label], linewidth=1.8)
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel(xlabel)
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel(xlabel, fontsize=13)
+        ax.tick_params(axis="both", labelsize=12)
         ax.grid(alpha=0.2)
-    axes[0].set_ylabel("ECDF")
-    axes[1].legend(loc="lower right", fontsize=8)
+    axes[0].set_ylabel("ECDF", fontsize=14)
+    axes[1].legend(loc="lower right", fontsize=11)
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=200)
     plt.close(fig)
 
 
-def save_round_gain(rows: list[dict[str, object]], output: Path) -> None:
+def save_round_gain(rows: list[dict[str, object]], output: Path, horizon: int = 14) -> None:
     x = [0, *[int(row["coordinate"]) for row in rows]]
     y = [float(rows[0]["objective_before"]), *[float(row["objective_after"]) for row in rows]]
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(x, y, color="#4d596d", marker="o", markersize=3, linewidth=1.5)
-    for boundary in (14, 28):
-        ax.axvline(boundary, color="#ad7c70", linestyle="--", linewidth=1)
-    ax.set_xlabel("Coordinate Update")
-    ax.set_ylabel("SAA Search Objective")
-    ax.set_xticks(range(0, 43, 7))
-    ax.grid(alpha=0.2)
-    fig.tight_layout()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=200)
-    plt.close(fig)
-
-
-def save_sensitivity(rows: list[dict[str, object]], output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    labels = ["1,NV", "1,SO", "2,QED", "2,SO"]
-    sigma_rows = [row for row in rows if row["sweep"] == "x_variance"]
-    if sigma_rows:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        for label in labels:
-            pts = sorted((float(row["value"]), float(row["mean_total_cost"]), float(row["ci95_lower"]), float(row["ci95_upper"])) for row in sigma_rows if row["benchmark"] == label)
-            if pts:
-                x, mean, low, high = map(list, zip(*pts))
-                ax.plot(x, mean, marker="o", label=policy_label(label), color=COLORS[label])
-                ax.fill_between(x, low, high, color=COLORS[label], alpha=0.12)
-        ax.set_xlabel("Var(X)")
-        ax.set_ylabel("Mean Total Cost")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(output_dir / "sigma_sweep_total_cost.png", dpi=200)
-        plt.close(fig)
-
-    fig, axes = plt.subplots(1, 3, figsize=(11, 3.5))
-    for ax, sweep in zip(axes, ("h_a", "c2", "alpha")):
-        for label in labels:
-            pts = sorted((float(row["value"]), float(row["mean_total_cost"]), float(row["ci95_lower"]), float(row["ci95_upper"])) for row in rows if row["sweep"] == sweep and row["benchmark"] == label)
-            if pts:
-                x, mean, low, high = map(list, zip(*pts))
-                ax.plot(x, mean, marker="o", label=policy_label(label), color=COLORS[label])
-                ax.fill_between(x, low, high, color=COLORS[label], alpha=0.12)
-        ax.set_title(sweep)
-        ax.set_xlabel(sweep)
+    with plt.rc_context({"font.family": "serif", "font.serif": ["cmr10"],
+                         "mathtext.fontset": "cm", "axes.formatter.use_mathtext": True}):
+        fig, ax = plt.subplots(figsize=(6.5, 3.5))
+        ax.plot(x, y, color=COLORS["1,NV"], marker="o", markersize=3, linewidth=1.5)
+        for boundary in range(horizon, len(rows), horizon):
+            ax.axvline(boundary, color=COLORS["1,SO"], linestyle="--", linewidth=1)
+        ax.set_xlabel("Coordinate Update", fontsize=11)
+        ax.set_ylabel("Average Total Cost", fontsize=11)
+        ax.set_xticks(range(0, len(rows) + 1, max(1, horizon // 2)))
+        ax.tick_params(labelsize=10)
         ax.grid(alpha=0.2)
-    axes[0].set_ylabel("Mean Total Cost")
-    handles, legend_labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="upper center", ncol=4, fontsize=8, frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
-    fig.savefig(output_dir / "sensitivity_total_cost.png", dpi=200)
-    plt.close(fig)
+        fig.tight_layout()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=400)
+        plt.close(fig)

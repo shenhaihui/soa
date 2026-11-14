@@ -1,45 +1,15 @@
 from __future__ import annotations
 
 import heapq
-from functools import lru_cache
 from itertools import count
 from typing import Any
 
 import numpy as np
-from scipy.special import ndtri_exp
-from scipy.stats import lognorm
 
 SHIFT_DURATION = 1.0
 PRIORITY_NORMAL = 0
 PRIORITY_INTERRUPTED = 1
 WAIT_OVER_10MIN = 10.0 / (12.0 * 60.0)
-
-
-def rep_seed(dataset_seed: int, scenario_id: int, replication_id: int) -> int:
-    return int(dataset_seed + 200_000 * int(scenario_id) + int(replication_id))
-
-
-def shift_seed(replication_seed: int, shift: int) -> int:
-    return int(replication_seed + 10_000 * int(shift))
-
-
-@lru_cache(maxsize=10_000)
-def build_shift_stream(lambda_fixed: float, mu: float, theta: float, seed: int) -> dict[str, tuple[float, ...]]:
-    if float(lambda_fixed) <= 0.0:
-        return {"arrival_offsets": (), "service_times": (), "patience_times": ()}
-    rng = np.random.RandomState(int(seed))
-    t = 0.0
-    arrivals: list[float] = []
-    services: list[float] = []
-    patiences: list[float] = []
-    while t < SHIFT_DURATION:
-        t += float(rng.exponential(1.0 / float(lambda_fixed)))
-        if t >= SHIFT_DURATION:
-            break
-        arrivals.append(float(t))
-        services.append(float(rng.exponential(1.0 / float(mu))))
-        patiences.append(float(rng.exponential(1.0 / float(theta))))
-    return {"arrival_offsets": tuple(arrivals), "service_times": tuple(services), "patience_times": tuple(patiences)}
 
 
 def build_shift_stream_crn(lambda_fixed: float, mu: float, theta: float, arrival_seed: int, service_seed: int, patience_seed: int) -> dict[str, tuple[float, ...]]:
@@ -71,41 +41,10 @@ def service_samples(rng: np.random.Generator, mu: float, distribution: str, scv:
     raise ValueError("Service distribution must be exponential or lognormal with positive SCV")
 
 
-def patience_samples(rng: np.random.Generator, theta: float, distribution: str, scv: float, size: int) -> np.ndarray:
-    if distribution == "exponential":
-        return rng.exponential(1.0 / float(theta), size=size)
-    if distribution == "gamma" and np.isfinite(scv) and scv > 0:
-        return rng.gamma(1.0 / scv, scv / float(theta), size=size)
-    raise ValueError("Patience distribution must be exponential or gamma with positive finite SCV")
-
-
-@lru_cache(maxsize=10_000)
-def _lognormal_survival_parameters(mu: float, scv: float, received: float) -> tuple[float, float, float]:
-    scale = float(np.sqrt(np.log1p(scv)))
-    location = float(-np.log(mu) - scale * scale / 2)
-    log_survival = float(lognorm.logsf(received, s=scale, scale=np.exp(location)))
-    return scale, location, log_survival
-
-
-def conditional_service_residual(rng: np.random.Generator, mu: float, distribution: str, scv: float, received: float) -> float:
-    if received < 0:
-        raise ValueError("Received service must be nonnegative")
-    if distribution == "exponential":
-        return float(rng.exponential(1.0 / mu))
-    if distribution != "lognormal" or scv <= 0:
-        raise ValueError("Unsupported conditional service distribution")
-    # Invert the conditional survival probability in log space, including old survivors.
-    scale, location, log_survival = _lognormal_survival_parameters(mu, scv, received)
-    log_tail = np.log(max(float(rng.random()), np.finfo(float).tiny)) + log_survival
-    full = float(np.exp(location - scale * ndtri_exp(log_tail)))
-    return max(np.finfo(float).eps, full - received)
-
-
 def build_model_stream(p: dict[str, Any], lam: float, arrival_seed: int, service_seed: int, patience_seed: int) -> dict[str, tuple[float, ...]]:
     arrival = p.get("arrival_distribution", "exponential")
     service = p.get("service_distribution", "exponential")
-    patience_distribution = p.get("patience_distribution", "exponential")
-    if arrival == service == patience_distribution == "exponential":
+    if arrival == service == "exponential":
         return build_shift_stream_crn(lam, p["mu"], p["theta"], arrival_seed, service_seed, patience_seed)
     if p.get("renewal_boundary", "restart_each_shift") != "restart_each_shift":
         raise ValueError("Only a fresh ordinary renewal interval at each shift start is implemented")
@@ -123,8 +62,7 @@ def build_model_stream(p: dict[str, Any], lam: float, arrival_seed: int, service
             break
         offsets.append(now)
     services = service_samples(np.random.default_rng(service_seed), p["mu"], service, p.get("service_scv", 1.0), len(offsets))
-    patience = patience_samples(np.random.default_rng(patience_seed), p["theta"], patience_distribution,
-                                p.get("patience_scv", 1.0), len(offsets))
+    patience = np.random.default_rng(patience_seed).exponential(1.0 / float(p["theta"]), size=len(offsets))
     return {"arrival_offsets": tuple(offsets), "service_times": tuple(map(float, services)), "patience_times": tuple(map(float, patience))}
 
 
@@ -145,7 +83,7 @@ def _clean_queue(queue: list[tuple[int, float, int, str]], patients: dict[str, d
         heapq.heappop(queue)
 
 
-def _queue_state(queue: list[tuple[int, float, int, str]], patients: dict[str, dict[str, Any]], now: float, track_service: bool = False) -> list[dict[str, Any]]:
+def _queue_state(queue: list[tuple[int, float, int, str]], patients: dict[str, dict[str, Any]], now: float) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for _, _, _, pid in sorted(queue):
         patient = patients.get(pid)
@@ -164,8 +102,6 @@ def _queue_state(queue: list[tuple[int, float, int, str]], patients: dict[str, d
                 "wait_over_10min_counted": bool(patient.get("wait_over_10min_counted", False)),
             }
         )
-        if track_service:
-            rows[-1]["service_received"] = float(patient.get("service_received", 0.0))
     return rows
 
 
@@ -183,18 +119,14 @@ def simulate_shift(
     seed: int,
     stream: dict[str, tuple[float, ...]],
     strict_stream: bool = False,
-    track_service: bool = False,
     cost_only: bool = False,
     balk_threshold: int | None = None,
     balk_penalty: float | None = None,
-    quadratic_queue_cost: float | None = None,
 ) -> dict[str, Any]:
     if balk_threshold is not None and (isinstance(balk_threshold, bool) or int(balk_threshold) != balk_threshold or balk_threshold < 0):
         raise ValueError("balk_threshold must be a nonnegative integer or None")
     if balk_penalty is not None and (not np.isfinite(balk_penalty) or balk_penalty < 0):
         raise ValueError("balk_penalty must be nonnegative and finite or None")
-    if quadratic_queue_cost is not None and (not np.isfinite(quadratic_queue_cost) or quadratic_queue_cost < 0):
-        raise ValueError("quadratic_queue_cost must be nonnegative and finite or None")
     events: list[tuple[float, int, int, str, dict[str, Any]]] = []
     serial = count()
     queue: list[tuple[int, float, int, str]] = []
@@ -205,7 +137,6 @@ def simulate_shift(
     queue_count = 0
     last_time = 0.0
     queue_area = 0.0
-    queue_squared_area = 0.0
     arrivals = 0
     abandons = 0
     balks = 0
@@ -221,12 +152,10 @@ def simulate_shift(
         heapq.heappush(events, (float(t), int(priority), next(serial), str(kind), payload))
 
     def update_area(t: float) -> None:
-        nonlocal last_time, queue_area, queue_squared_area
+        nonlocal last_time, queue_area
         t = min(float(t), SHIFT_DURATION)
         if t > last_time:
             queue_area += queue_count * (t - last_time)
-            if quadratic_queue_cost is not None:
-                queue_squared_area += queue_count ** 2 * (t - last_time)
             last_time = t
 
     def mark_wait(patient: dict[str, Any], now: float, keep_waiting: bool) -> None:
@@ -277,8 +206,6 @@ def simulate_shift(
         patient["remaining_service_time"] = None
         end_time = float(now) + float(service_time)
         active[pid] = end_time
-        if track_service:
-            patient["service_started_at"] = float(now)
         available -= 1
         schedule(end_time, 2, "service_end", {"pid": pid, "end_time": end_time})
 
@@ -293,8 +220,6 @@ def simulate_shift(
     for idx, state in enumerate(initial_state):
         pid = f"I{idx + 1}"
         patients[pid] = {
-            "id": pid,
-            "arrival_time": 0.0,
             "arrival_rank": float(state.get("arrival_rank", idx)),
             "queue_enter_time": 0.0,
             "priority": int(state.get("priority", PRIORITY_NORMAL)),
@@ -307,8 +232,6 @@ def simulate_shift(
             "abandoned": False,
             "in_queue": False,
         }
-        if track_service:
-            patients[pid]["service_received"] = float(state.get("service_received", 0.0))
         if not patients[pid]["has_started_service"] and state.get("remaining_patience_time") is not None:
             abandon_time = max(0.0, float(state["remaining_patience_time"]))
             patients[pid]["abandon_time"] = abandon_time
@@ -337,8 +260,6 @@ def simulate_shift(
             pid = f"A{arrivals}"
             patience = float(payload["patience_time"])
             patients[pid] = {
-                "id": pid,
-                "arrival_time": float(t),
                 "arrival_rank": float(max_initial_rank + arrivals),
                 "queue_enter_time": float(t),
                 "priority": PRIORITY_NORMAL,
@@ -379,12 +300,6 @@ def simulate_shift(
     base_cost = float(c1) * int(n1)
     surge_cost = float(c2) * int(n2)
     waiting_cost = float(h) * queue_area
-    queue_metrics = {}
-    if quadratic_queue_cost is not None:
-        quadratic_cost = float(quadratic_queue_cost) * queue_squared_area
-        queue_metrics = {"queue_squared_area": queue_squared_area,
-                         "linear_waiting_cost": waiting_cost, "quadratic_waiting_cost": quadratic_cost}
-        waiting_cost += quadratic_cost
     abandonment_cost = float(a) * abandons
     balk_cost = float(a if balk_penalty is None else balk_penalty) * balks
     balk_metrics = {"balk_count": int(balks), "balk_cost": balk_cost} if balk_threshold is not None else {}
@@ -393,12 +308,12 @@ def simulate_shift(
         return {"total_cost": base_cost + surge_cost + waiting_cost + abandonment_cost + balk_cost,
                 "base_cost": base_cost, "surge_cost": surge_cost,
                 "waiting_cost": waiting_cost, "abandonment_cost": abandonment_cost,
-                "queue_area": float(queue_area), "abandon_count": int(abandons), **balk_metrics, **queue_metrics}
+                "queue_area": float(queue_area), "abandon_count": int(abandons), **balk_metrics}
     for patient in patients.values():
         if patient.get("in_queue") and not patient.get("abandoned"):
             mark_wait(patient, SHIFT_DURATION, keep_waiting=True)
 
-    final_state = _queue_state(queue, patients, SHIFT_DURATION, track_service)
+    final_state = _queue_state(queue, patients, SHIFT_DURATION)
     for pid, end_time in active.items():
         patient = patients[pid]
         final_state.append(
@@ -413,9 +328,6 @@ def simulate_shift(
                 "wait_over_10min_counted": bool(patient.get("wait_over_10min_counted", False)),
             }
         )
-
-        if track_service:
-            final_state[-1]["service_received"] = float(patient.get("service_received", 0.0)) + SHIFT_DURATION - patient["service_started_at"]
 
     lwbs_rate = float((abandons + balks) / risk_count) if risk_count > 0 else 0.0
     if balk_threshold is not None:
@@ -438,16 +350,4 @@ def simulate_shift(
         "lwbs_rate": float(lwbs_rate),
         "final_state": final_state,
         **balk_metrics,
-        **queue_metrics,
     }
-
-
-def pool_by_id(pool: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    return {int(item["pool_id"]): item for item in pool}
-
-
-def pool_by_shift(pool: list[dict[str, Any]], horizon: int) -> dict[int, list[dict[str, Any]]]:
-    grouped = {shift: [] for shift in range(int(horizon))}
-    for item in pool:
-        grouped[int(item["shift_type"])].append(item)
-    return grouped

@@ -13,12 +13,11 @@ from typing import Any
 import numpy as np
 from scipy.stats import t as student_t
 
-from formulas import eta_star, newsvendor_n1, qed_n1, qed_n2
-from simulation import build_model_stream, build_shift_stream_crn, service_samples, simulate_shift
+from formulas import eta_star, newsvendor_n1, qed_n1, qed_n2, round_half_up
+from simulation import build_model_stream, service_samples, simulate_shift
 
 _WORKER_P: dict[str, Any] | None = None
 _WORKER_DATASET: list[dict[str, Any]] | None = None
-_WORKER_POOL: list[dict[str, Any]] | None = None
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -134,7 +133,7 @@ def rate_lookup_n2(lookup: list[dict[str, Any]], lam: float) -> int:
 
 def numerical_params() -> dict[str, Any]:
     return {
-        "warmup_shifts": 10,
+        "initial_patient_count": 0,
         "lambda_mean": 100.0,
         "alpha": 0.75,
         "sigma": 1.0,
@@ -147,35 +146,14 @@ def numerical_params() -> dict[str, Any]:
         "search_scenarios": 1000,
         "eval_scenarios": 1000,
         "replications": 100,
-        "pool_size": 3000,
-        "warmup_seed": 100_000_000,
-        "search_seed": 500_000_000,
-        "online_n2_seed": 1_000_000_000,
-        "eval_seed": 1_500_000_000,
+        "seed_namespace": 2026102802,
+        "search_seed": 1,
+        "online_n2_seed": 2,
+        "eval_seed": 3,
         "search_upper_multiplier": 2,
         "n2_search_upper_floor": 20,
         "workers": max(1, (os.cpu_count() or 2) // 2),
     }
-
-
-def warmup_sample(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
-    sample_id, p = args
-    sample_seed = int(p["warmup_seed"]) + 97 * int(sample_id)
-    rng = np.random.default_rng(sample_seed)
-    n1 = qed_n1(p["lambda_mean"], p["c1"], p["c2"], p["h"], p["mu"], p["theta"], p["a"], p["sigma"], p["alpha"])
-    state: list[dict[str, Any]] = []
-    for shift in range(int(p["warmup_shifts"])):
-        lam = sample_lambda(rng, p["lambda_mean"], p["alpha"], p["sigma"])
-        n2 = qed_n2(lam, n1, p["h"], p["mu"], p["theta"], p["a"], p["c2"])
-        base_seed = sample_seed + 10_000 * int(shift)
-        stream = build_shift_stream_crn(
-            lam, p["mu"], p["theta"],
-            base_seed + 1,
-            base_seed + 2,
-            base_seed + 3,
-        )
-        state = simulate_shift(state, n1, n2, lam, p["mu"], p["theta"], p["c1"], p["c2"], p["h"], p["a"], base_seed + 4, stream, balk_threshold=p.get("balk_threshold"), balk_penalty=p.get("balk_penalty"))["final_state"]
-    return {"sample_id": int(sample_id), "patients_state": state}
 
 
 def parallel_map(fn: Any, tasks: list[Any], executor: Any | None) -> list[Any]:
@@ -184,32 +162,19 @@ def parallel_map(fn: Any, tasks: list[Any], executor: Any | None) -> list[Any]:
     return list(executor.map(fn, tasks))
 
 
-def build_warmup_pool(p: dict[str, Any], output: Path, executor: Any | None) -> list[dict[str, Any]]:
-    pool = parallel_map(warmup_sample, [(i, p) for i in range(int(p["pool_size"]))], executor)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(pool, indent=2), encoding="utf-8")
-    return pool
-
-
-def build_dataset(p: dict[str, Any], pool_size: int, count: int, seed: int, tag: str, lambda_values: list[float] | None = None) -> list[dict[str, Any]]:
-    if p.get("initialization", "warmup") not in ("warmup", "fixed_count", "count_mixture"):
-        raise ValueError("Unknown initialization mode")
+def build_dataset(p: dict[str, Any], count: int, seed: int, tag: str, lambda_values: list[float] | None = None) -> list[dict[str, Any]]:
     rows = []
     for sid in range(int(count)):
         trials = []
         for rep in range(int(p["replications"])):
-            base_seed = (namespaced_seed(int(p["seed_namespace"]), int(seed), sid, rep, 0)
-                         if "seed_namespace" in p else int(seed) + 100_000 * int(sid) + 10 * int(rep))
-            pool_rng = np.random.default_rng(base_seed + 4)
+            base_seed = namespaced_seed(int(p["seed_namespace"]), int(seed), sid, rep, 0)
             trials.append({
-                "pool_index": int(pool_rng.integers(0, pool_size)) if p.get("initialization", "warmup") == "warmup" else None,
                 "arrival_seed": base_seed + 1,
                 "service_seed": base_seed + 2,
                 "patience_seed": base_seed + 3,
             })
         if lambda_values is None:
-            lambda_seed = (namespaced_seed(int(p["seed_namespace"]), int(seed), sid, 0, 5)
-                           if "seed_namespace" in p else int(seed) + 200_000_000 + int(sid))
+            lambda_seed = namespaced_seed(int(p["seed_namespace"]), int(seed), sid, 0, 5)
             lambda_rng = np.random.default_rng(lambda_seed)
             lam = sample_lambda(lambda_rng, p["lambda_mean"], p["alpha"], p["sigma"])
         else:
@@ -218,46 +183,24 @@ def build_dataset(p: dict[str, Any], pool_size: int, count: int, seed: int, tag:
     return rows
 
 
-def eval_total_task(task: tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], int]) -> dict[str, Any]:
-    p, scenario, pool, total_servers = task
+def eval_total_task(task: tuple[dict[str, Any], dict[str, Any], int]) -> dict[str, Any]:
+    p, scenario, total_servers = task
     vals = []
-    initialization = p.get("initialization", "warmup")
-    if initialization == "count_mixture":
-        if p.get("record_terminal_counts", False):
-            raise ValueError("Raw terminal counts require a single initial-state setting")
-        counts = p["initial_patient_counts"]
-        if not counts:
-            raise ValueError("initial_patient_counts must not be empty")
-        # Average costs/performance before optimizing, not separately optimized decisions.
-        results = [eval_total_task(({**p, "initialization": "fixed_count", "initial_patient_count": count},
-                                    scenario, pool, total_servers)) for count in counts]
-        identifiers = {"scenario_id", "lambda_fixed", "total_servers"}
-        return {key: value if key in identifiers else float(np.mean([r[key] for r in results]))
-                for key, value in results[0].items()}
-    if initialization not in ("warmup", "fixed_count"):
-        raise ValueError("Unknown initialization mode")
-    if initialization == "fixed_count":
-        initial_count = int(p["initial_patient_count"])
-        if initial_count < 0 or initial_count != p["initial_patient_count"]:
-            raise ValueError("initial_patient_count must be a nonnegative integer")
+    initial_count = int(p["initial_patient_count"])
+    if initial_count < 0 or initial_count != p["initial_patient_count"]:
+        raise ValueError("initial_patient_count must be a nonnegative integer")
     for trial in scenario["trials"]:
-        if initialization == "fixed_count":
-            # Reuse the unused pool-selection stream for initial residual services.
-            rng = np.random.default_rng(int(trial["patience_seed"]) + 1)
-            residual = p.get("initial_residual_distribution", "exponential")
-            if p.get("service_distribution", "exponential") != "exponential" and "initial_residual_distribution" not in p:
-                raise ValueError("Non-exponential service requires an explicit initial residual assumption")
-            state = [{"has_started_service": True, "remaining_service_time": float(remaining)}
-                     for remaining in service_samples(rng, p["mu"], residual, p.get("initial_residual_scv", 1.0), initial_count)]
-        else:
-            state = pool[int(trial["pool_index"])]["patients_state"]
+        rng = np.random.default_rng(int(trial["patience_seed"]) + 1)
+        residual = p.get("initial_residual_distribution", "exponential")
+        if p.get("service_distribution", "exponential") != "exponential" and "initial_residual_distribution" not in p:
+            raise ValueError("Non-exponential service requires an explicit initial residual assumption")
+        state = [{"has_started_service": True, "remaining_service_time": float(remaining)}
+                 for remaining in service_samples(rng, p["mu"], residual, p.get("initial_residual_scv", 1.0), initial_count)]
         stream = build_model_stream(p, scenario["lambda_fixed"], trial["arrival_seed"], trial["service_seed"], trial["patience_seed"])
-        vals.append(simulate_shift(state, total_servers, 0, scenario["lambda_fixed"], p["mu"], p["theta"], p["c1"], p["c2"], p["h"], p["a"], trial["service_seed"], stream, strict_stream=p.get("strict_stream", False), balk_threshold=p.get("balk_threshold"), balk_penalty=p.get("balk_penalty"), quadratic_queue_cost=p.get("quadratic_queue_cost")))
+        vals.append(simulate_shift(state, total_servers, 0, scenario["lambda_fixed"], p["mu"], p["theta"], p["c1"], p["c2"], p["h"], p["a"], trial["service_seed"], stream, strict_stream=p.get("strict_stream", False), balk_threshold=p.get("balk_threshold"), balk_penalty=p.get("balk_penalty")))
     keys = ("queue_area", "abandon_count", "arrival_count", "patient_count", "lwbs_risk_count", "avg_queue", "avg_wait_time", "lwbs_rate")
     if p.get("balk_threshold") is not None:
         keys += ("balk_count", "admitted_arrival_count", "balk_rate")
-    if p.get("quadratic_queue_cost") is not None:
-        keys += ("queue_squared_area",)
     out = {"scenario_id": int(scenario["scenario_id"]), "lambda_fixed": float(scenario["lambda_fixed"]), "total_servers": int(total_servers)}
     for key in keys:
         out[key] = float(np.mean([v[key] for v in vals]))
@@ -272,25 +215,24 @@ def eval_total_task(task: tuple[dict[str, Any], dict[str, Any], list[dict[str, A
     return out
 
 
-def init_perf_worker(p: dict[str, Any], dataset: list[dict[str, Any]], pool: list[dict[str, Any]]) -> None:
-    global _WORKER_P, _WORKER_DATASET, _WORKER_POOL
+def init_perf_worker(p: dict[str, Any], dataset: list[dict[str, Any]]) -> None:
+    global _WORKER_P, _WORKER_DATASET
     _WORKER_P = p
     _WORKER_DATASET = dataset
-    _WORKER_POOL = pool
 
 
 def eval_total_worker_task(task: tuple[int, int]) -> dict[str, Any]:
     sid, total = task
-    if _WORKER_P is None or _WORKER_DATASET is None or _WORKER_POOL is None:
+    if _WORKER_P is None or _WORKER_DATASET is None:
         raise RuntimeError("worker context is not initialized")
-    return eval_total_task((_WORKER_P, _WORKER_DATASET[int(sid)], _WORKER_POOL, int(total)))
+    return eval_total_task((_WORKER_P, _WORKER_DATASET[int(sid)], int(total)))
 
 
-def ensure_perf(p: dict[str, Any], dataset: list[dict[str, Any]], pool: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], requests: list[tuple[int, int]], executor: Any | None) -> None:
+def ensure_perf(p: dict[str, Any], dataset: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], requests: list[tuple[int, int]], executor: Any | None) -> None:
     unique = list(dict.fromkeys((int(sid), int(total)) for sid, total in requests))
     missing = [(sid, total) for sid, total in unique if (sid, total) not in cache]
     if executor is None or len(missing) < 8:
-        results = [eval_total_task((p, dataset[sid], pool, total)) for sid, total in missing]
+        results = [eval_total_task((p, dataset[sid], total)) for sid, total in missing]
     else:
         results = executor.map(eval_total_worker_task, missing)
     for result in results:
@@ -298,10 +240,7 @@ def ensure_perf(p: dict[str, Any], dataset: list[dict[str, Any]], pool: list[dic
 
 
 def waiting_cost(p: dict[str, Any], perf: dict[str, Any]) -> float:
-    cost = p["h"] * perf["queue_area"]
-    if p.get("quadratic_queue_cost") is not None:
-        cost += p["quadratic_queue_cost"] * perf["queue_squared_area"]
-    return float(cost)
+    return float(p["h"] * perf["queue_area"])
 
 
 def recourse_cost(p: dict[str, Any], perf: dict[str, Any], n2: int) -> float:
@@ -310,7 +249,7 @@ def recourse_cost(p: dict[str, Any], perf: dict[str, Any], n2: int) -> float:
     return float(p["c2"] * int(n2) + waiting_cost(p, perf) + p["a"] * (perf["abandon_count"] + perf.get("balk_count", 0)))
 
 
-def best_n2_batch(p: dict[str, Any], dataset: list[dict[str, Any]], n1: int, pool: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], executor: Any | None, memo: dict[tuple[int, int], int]) -> dict[int, int]:
+def best_n2_batch(p: dict[str, Any], dataset: list[dict[str, Any]], n1: int, cache: dict[tuple[int, int], dict[str, Any]], executor: Any | None, memo: dict[tuple[int, int], int]) -> dict[int, int]:
     # Reuse performance within a policy; keep memo local to its cost/domain.
     states = []
     out = {}
@@ -331,7 +270,7 @@ def best_n2_batch(p: dict[str, Any], dataset: list[dict[str, Any]], n1: int, poo
             cands = sorted({max(0, item["current"] - 1), item["current"], min(item["upper"], item["current"] + 1)})
             item["cands"] = cands
             requests.extend((item["sid"], n1 + n2) for n2 in cands)
-        ensure_perf(p, dataset, pool, cache, requests, executor)
+        ensure_perf(p, dataset, cache, requests, executor)
         next_states = []
         for item in states:
             sid = item["sid"]
@@ -347,14 +286,14 @@ def best_n2_batch(p: dict[str, Any], dataset: list[dict[str, Any]], n1: int, poo
     return out
 
 
-def objective_1so(p: dict[str, Any], n1: int, dataset: list[dict[str, Any]], pool: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], executor: Any | None) -> float:
-    ensure_perf(p, dataset, pool, cache, [(s["scenario_id"], n1) for s in dataset], executor)
+def objective_1so(p: dict[str, Any], n1: int, dataset: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], executor: Any | None) -> float:
+    ensure_perf(p, dataset, cache, [(s["scenario_id"], n1) for s in dataset], executor)
     vals = [recourse_cost(p, cache[(s["scenario_id"], n1)], 0) for s in dataset]
     return float(p["c1"] * int(n1) + np.mean(vals))
 
 
-def objective_2so(p: dict[str, Any], n1: int, dataset: list[dict[str, Any]], pool: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], executor: Any | None, n2_memo: dict[tuple[int, int], int]) -> float:
-    n2_by_sid = best_n2_batch(p, dataset, n1, pool, cache, executor, n2_memo)
+def objective_2so(p: dict[str, Any], n1: int, dataset: list[dict[str, Any]], cache: dict[tuple[int, int], dict[str, Any]], executor: Any | None, n2_memo: dict[tuple[int, int], int]) -> float:
+    n2_by_sid = best_n2_batch(p, dataset, n1, cache, executor, n2_memo)
     vals = []
     for s in dataset:
         sid = int(s["scenario_id"])
@@ -401,10 +340,6 @@ def scenario_row(p: dict[str, Any], label: str, perf: dict[str, Any], n1: int, n
     if p.get("balk_threshold") is not None:
         row.update(balk_cost=balk, balk_count=perf["balk_count"], balk_rate=perf["balk_rate"],
                    admitted_arrival_count=perf["admitted_arrival_count"])
-    if p.get("quadratic_queue_cost") is not None:
-        row.update(queue_squared_area=perf["queue_squared_area"],
-                   linear_waiting_cost=p["h"] * perf["queue_area"],
-                   quadratic_waiting_cost=p["quadratic_queue_cost"] * perf["queue_squared_area"])
     return row
 
 
@@ -425,10 +360,6 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
                       MeanBalkCost=float(np.mean([r["balk_cost"] for r in rows])),
                       MeanBalkRate=float(np.mean([r["balk_rate"] for r in rows])),
                       MeanAdmittedArrivalCount=float(np.mean([r["admitted_arrival_count"] for r in rows])))
-    if "queue_squared_area" in rows[0]:
-        result.update(MeanQueueSquaredArea=float(np.mean([r["queue_squared_area"] for r in rows])),
-                      MeanLinearWaitingCost=float(np.mean([r["linear_waiting_cost"] for r in rows])),
-                      MeanQuadraticWaitingCost=float(np.mean([r["quadratic_waiting_cost"] for r in rows])))
     return result
 
 
@@ -447,50 +378,37 @@ def write_terminal_diagnostics(output_root: Path, rows: list[dict[str, Any]]) ->
     write_csv(output_root / "terminal_count_summary.csv", summary)
 
 
-def run_single(output_root: Path, use_parallel: bool = True, params: dict[str, Any] | None = None, environment: tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+def run_single(output_root: Path, use_parallel: bool = True, params: dict[str, Any] | None = None) -> dict[str, Any]:
     t0 = time.perf_counter()
     p = dict(params or numerical_params())
     lookup_enabled = bool(p.get("include_so_lookup", False))
-    qed_lookup_only = bool(p.get("qed_lookup_only", False))
-    if qed_lookup_only and not lookup_enabled:
-        raise ValueError("qed_lookup_only requires include_so_lookup")
     direct_label = "2,SO-Direct" if lookup_enabled else "2,SO"
-    so_label = "2,SO-Lookup" if qed_lookup_only else direct_label
+    so_label = direct_label
     # Raw terminal states are needed only for final evaluation, not every search candidate.
     search_p = {**p, "record_terminal_counts": False} if p.get("record_terminal_counts", False) else p
     parallel_enabled = bool(use_parallel)
     output_root.mkdir(parents=True, exist_ok=True)
     timings: dict[str, float] = {}
     start = time.perf_counter()
-    needs_warmup = p.get("initialization", "warmup") == "warmup"
-    warmup_executor = ProcessPoolExecutor(max_workers=p.get("workers")) if parallel_enabled and environment is None and needs_warmup else None
-    try:
-        if environment is None:
-            pool = build_warmup_pool(p, output_root / "warmup_pool.json", warmup_executor) if needs_warmup else []
-            search = build_dataset(p, len(pool), p["search_scenarios"], p["search_seed"], "search")
-            evl = build_dataset(p, len(pool), p["eval_scenarios"], p["eval_seed"], "eval")
-            online = [] if qed_lookup_only else build_dataset(p, len(pool), p["eval_scenarios"], p["online_n2_seed"], "online_n2", [s["lambda_fixed"] for s in evl])
-        else:
-            pool, search, online, evl = environment
-        timings["environment"] = time.perf_counter() - start
-    finally:
-        if warmup_executor is not None:
-            warmup_executor.shutdown()
-    n1_nv = None if qed_lookup_only else newsvendor_n1(p["lambda_mean"], p["c1"], p["h"], p["mu"], p["theta"], p["a"], p["sigma"], p["alpha"])
+    search = build_dataset(p, p["search_scenarios"], p["search_seed"], "search")
+    evl = build_dataset(p, p["eval_scenarios"], p["eval_seed"], "eval")
+    online = build_dataset(p, p["eval_scenarios"], p["online_n2_seed"], "online_n2", [s["lambda_fixed"] for s in evl])
+    timings["environment"] = time.perf_counter() - start
+    n1_nv = newsvendor_n1(p["lambda_mean"], p["c1"], p["h"], p["mu"], p["theta"], p["a"], p["sigma"], p["alpha"])
     n1_qed = qed_n1(p["lambda_mean"], p["c1"], p["c2"], p["h"], p["mu"], p["theta"], p["a"], p["sigma"], p["alpha"])
     n2_memo: dict[tuple[int, int], int] = {}
     one = None
-    search_jobs = ([] if qed_lookup_only else [("1so", n1_nv)]) + [("2so", n1_qed)]
+    search_jobs = [("1so", n1_nv), ("2so", n1_qed)]
     for method, initial in search_jobs:
         # Each policy starts with empty performance/formula caches and fresh workers.
         search_cache: dict[tuple[int, int], dict[str, Any]] = {}
         eta_star.cache_clear()
         print(f"[Single] START offline {method}", flush=True)
         start = time.perf_counter()
-        search_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(search_p, search, pool)) if parallel_enabled else None
+        search_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(search_p, search)) if parallel_enabled else None
         try:
-            objective = (lambda n: objective_1so(search_p, n, search, pool, search_cache, search_executor)) if method == "1so" else (
-                lambda n: objective_2so(search_p, n, search, pool, search_cache, search_executor, n2_memo))
+            objective = (lambda n: objective_1so(search_p, n, search, search_cache, search_executor)) if method == "1so" else (
+                lambda n: objective_2so(search_p, n, search, search_cache, search_executor, n2_memo))
             result = hill_climb(initial, objective, p["search_upper_multiplier"], p.get("n1_upper"))
         finally:
             if search_executor is not None:
@@ -510,10 +428,10 @@ def run_single(output_root: Path, use_parallel: bool = True, params: dict[str, A
         if extra_count < 0:
             raise ValueError("lookup_scenarios cannot be smaller than search_scenarios")
         if extra_count:
-            extra = build_dataset(p, len(pool), extra_count, p["lookup_seed"], "lookup_extra")
-            extra_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(search_p, extra, pool)) if parallel_enabled else None
+            extra = build_dataset(p, extra_count, p["lookup_seed"], "lookup_extra")
+            extra_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(search_p, extra)) if parallel_enabled else None
             try:
-                extra_n2 = best_n2_batch(search_p, extra, two["best_n1"], pool, {}, extra_executor, {})
+                extra_n2 = best_n2_batch(search_p, extra, two["best_n1"], {}, extra_executor, {})
             finally:
                 if extra_executor is not None:
                     extra_executor.shutdown()
@@ -529,40 +447,37 @@ def run_single(output_root: Path, use_parallel: bool = True, params: dict[str, A
     terminal_rows: list[dict[str, Any]] = []
     online_n2: dict[str, dict[int, int]] = {}
     online_times: dict[str, float] = {}
-    online_jobs = [] if qed_lookup_only else [(direct_label, int(two["best_n1"]), "online_direct_n2")]
-    if not qed_lookup_only and p.get("include_qed_n2_search", False):
+    online_jobs = [(direct_label, int(two["best_n1"]), "online_direct_n2")]
+    if p.get("include_qed_n2_search", False):
         online_jobs.append(("QED-N1+SO-N2", n1_qed, "online_qed_n2"))
     for label, n1, timing_key in online_jobs:
         eta_star.cache_clear()
         print(f"[Single] START online {label}", flush=True)
         start = time.perf_counter()
-        online_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(search_p, online, pool)) if parallel_enabled else None
+        online_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(search_p, online)) if parallel_enabled else None
         try:
-            online_n2[label] = best_n2_batch(search_p, online, n1, pool, {}, online_executor, {})
+            online_n2[label] = best_n2_batch(search_p, online, n1, {}, online_executor, {})
         finally:
             if online_executor is not None:
                 online_executor.shutdown()
         timings[timing_key] = online_times[label] = time.perf_counter() - start
         print(f"[Single] END online {label}, elapsed={online_times[label]:.1f}s", flush=True)
-    if lookup_enabled and not qed_lookup_only:
+    if lookup_enabled:
         timings["online_decisions"] = sum(online_times.values())
-    if qed_lookup_only:
-        policies = [("2,QED", n1_qed), ("2,SO-Lookup", two["best_n1"])]
-    else:
-        policies = [("1,NV", n1_nv)] if p.get("include_1nv", True) else []
-        policies += [("1,SO", one["best_n1"]), ("2,QED", n1_qed)]
-        if p.get("include_qed_n2_search", False):
-            policies.append(("QED-N1+SO-N2", n1_qed))
-        policies.append((direct_label, two["best_n1"]))
-        if lookup_enabled:
-            policies.append(("2,SO-Lookup", two["best_n1"]))
+    policies = [("1,NV", n1_nv)] if p.get("include_1nv", True) else []
+    policies += [("1,SO", one["best_n1"]), ("2,QED", n1_qed)]
+    if p.get("include_qed_n2_search", False):
+        policies.append(("QED-N1+SO-N2", n1_qed))
+    policies.append((direct_label, two["best_n1"]))
+    if lookup_enabled:
+        policies.append(("2,SO-Lookup", two["best_n1"]))
     evaluation_times: dict[str, float] = {}
     start = time.perf_counter()
     for label, n1 in policies:
         eta_star.cache_clear()
         eval_cache: dict[tuple[int, int], dict[str, Any]] = {}
         policy_start = time.perf_counter()
-        eval_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(p, evl, pool)) if parallel_enabled else None
+        eval_executor = ProcessPoolExecutor(max_workers=p.get("workers"), initializer=init_perf_worker, initargs=(p, evl)) if parallel_enabled else None
         try:
             requests = []
             n2_by_sid = dict(online_n2.get(label, {}))
@@ -572,7 +487,7 @@ def run_single(output_root: Path, use_parallel: bool = True, params: dict[str, A
                 n2 = 0 if label in {"1,NV", "1,SO"} else (qed_n2(s["lambda_fixed"], n1, p["h"], p["mu"], p["theta"], p["a"], p["c2"]) if label == "2,QED" else n2_by_sid[int(s["scenario_id"])])
                 n2_by_sid[s["scenario_id"]] = n2
                 requests.append((s["scenario_id"], n1 + n2))
-            ensure_perf(p, evl, pool, eval_cache, requests, eval_executor)
+            ensure_perf(p, evl, eval_cache, requests, eval_executor)
             for s in evl:
                 n2 = n2_by_sid[s["scenario_id"]]
                 perf = eval_cache[(s["scenario_id"], n1 + n2)]
@@ -610,7 +525,7 @@ def run_single(output_root: Path, use_parallel: bool = True, params: dict[str, A
     timings["outputs_and_figures"] = time.perf_counter() - start
     timings["total"] = time.perf_counter() - t0
     searches = {so_label: two} if one is None else {"1,SO": one, so_label: two}
-    summary = {"config": p, "pool_size": len(pool), "paths": {"summary_json": str(output_root / "summary.json")}, "timings_sec": timings, "search": searches, "benchmarks": {r["Benchmark"]: r for r in bench}}
+    summary = {"config": p, "paths": {"summary_json": str(output_root / "summary.json")}, "timings_sec": timings, "search": searches, "benchmarks": {r["Benchmark"]: r for r in bench}}
     summary["policy_timings_sec"] = {
         label: {"offline_search": search_times[label], "online_search": online_times.get(label, 0.0),
                 "evaluation": evaluation_times[label]} for label in order
@@ -699,91 +614,9 @@ def write_diagnostics(output_root: Path, rows: list[dict[str, Any]], order: tupl
     for label, group in groups:
         savings = [pair["2,QED"]["total_cost"] - pair[so_label]["total_cost"] for pair in group]
         wins = sum(x > 0.0 for x in savings)
-        quartiles.append({"demand_quartile": label, "scenario_count": len(group), "2so_win_count": wins, "2so_win_rate_pct": round(100.0 * wins / len(group), 1), "mean_cost_saving": round(float(np.mean(savings)), 2), "avg_n2_2qed": round(float(np.mean([pair["2,QED"]["n2"] for pair in group])), 2), "avg_n2_2so": round(float(np.mean([pair[so_label]["n2"] for pair in group])), 2)})
+        quartiles.append({"demand_quartile": label, "scenario_count": len(group), "2so_win_count": wins, "2so_win_rate_pct": round_half_up(100.0 * wins / len(group), 1), "mean_cost_saving": round_half_up(float(np.mean(savings)), 2), "avg_n2_2qed": round_half_up(float(np.mean([pair["2,QED"]["n2"] for pair in group])), 2), "avg_n2_2so": round_half_up(float(np.mean([pair[so_label]["n2"] for pair in group])), 2)})
     write_csv(output_root / "cost_decomposition.csv", decomp)
     write_csv(output_root / "diagnostics_table.csv", diag)
     write_csv(output_root / "demand_quantile_table.csv", quant)
     write_csv(output_root / "demand_quartile_comparison.csv", quartiles)
     return decomp
-
-
-def sensitivity_specs() -> list[tuple[str, str, tuple[float, ...]]]:
-    return [
-        ("h_a", "h", (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)),
-        ("c2", "c2", (1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8)),
-        ("alpha", "alpha", (0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90)),
-        ("x_variance", "x_variance", (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)),
-    ]
-
-
-def run_sensitivity(output_root: Path, use_parallel: bool = True, params: dict[str, Any] | None = None, specs: list[tuple[str, str, tuple[float, ...]]] | None = None) -> dict[str, Any]:
-    t0 = time.perf_counter()
-    rows = []
-    base = dict(params or numerical_params())
-    sweeps = sensitivity_specs() if specs is None else specs
-    executor = ProcessPoolExecutor(max_workers=base.get("workers")) if use_parallel else None
-    try:
-        shared_pool = build_warmup_pool(base, output_root / "shared" / "warmup_pool.json", executor)
-        shared_search = build_dataset(base, len(shared_pool), base["search_scenarios"], base["search_seed"], "search")
-        shared_eval = build_dataset(base, len(shared_pool), base["eval_scenarios"], base["eval_seed"], "eval")
-        shared_online = build_dataset(base, len(shared_pool), base["eval_scenarios"], base["online_n2_seed"], "online_n2", [s["lambda_fixed"] for s in shared_eval])
-        shared_env = (shared_pool, shared_search, shared_online, shared_eval)
-        if executor is not None:
-            executor.shutdown()
-            executor = None
-        for name, param, values in sweeps:
-            for value in values:
-                p = dict(base)
-                if name == "h_a":
-                    p["h"], p["a"] = float(value), 2.0 * float(value)
-                elif name == "c2":
-                    p["c2"] = float(value)
-                elif name == "alpha":
-                    p["alpha"] = float(value)
-                else:
-                    p["sigma"] = math.sqrt(float(value))
-                point = output_root / name / str(value).replace(".", "p")
-                summary = run_single(point, use_parallel, p, shared_env if name in {"h_a", "c2"} else None)
-                for label, agg in summary["benchmarks"].items():
-                    rows.append({
-                        "sweep": name, "parameter": param, "value": float(value), "benchmark": label,
-                        "mean_total_cost": agg["MeanTotalCost"], "mean_base_cost": agg["MeanBaseCost"],
-                        "mean_surge_cost": agg["MeanSurgeCost"], "mean_waiting_cost": agg["MeanWaitingCost"],
-                        "mean_abandonment_cost": agg["MeanAbandonmentCost"], "mean_staff_cost": agg["MeanStaffCost"],
-                        "mean_qos_cost": agg["MeanQoSCost"], "mean_avg_queue": agg["MeanAvgQueue"],
-                        "mean_avg_wait_time": agg["MeanAvgWaitTime"], "mean_lwbs_rate": agg["MeanLWBSRate"],
-                        "ci95_lower": agg["CILow"], "ci95_upper": agg["CIHigh"],
-                    })
-        variance_table = []
-        for value in sorted({row["value"] for row in rows if row["sweep"] == "x_variance"}):
-            costs = {row["benchmark"]: row["mean_total_cost"] for row in rows if row["sweep"] == "x_variance" and row["value"] == value}
-            two_so = costs["2,SO"]
-            variance_table.append({"x_variance": value, "cost_1nv": round(costs["1,NV"], 3), "cost_1so": round(costs["1,SO"], 3), "cost_2qed": round(costs["2,QED"], 3), "cost_2so": round(two_so, 3), "saving_vs_1nv_pct": round(100.0 * (costs["1,NV"] - two_so) / costs["1,NV"], 2), "saving_vs_1so_pct": round(100.0 * (costs["1,SO"] - two_so) / costs["1,SO"], 2), "saving_vs_2qed_pct": round(100.0 * (costs["2,QED"] - two_so) / costs["2,QED"], 2)})
-        write_csv(output_root / "sensitivity_table.csv", rows)
-        write_csv(output_root / "variance_comparison_table.csv", variance_table)
-        from figures import save_sensitivity
-
-        save_sensitivity(rows, output_root)
-        summary = {"base_config": base, "sweeps": [{"name": n, "parameter": p, "values": v} for n, p, v in sweeps], "paths": {"sensitivity_table_csv": str(output_root / "sensitivity_table.csv"), "variance_comparison_table_csv": str(output_root / "variance_comparison_table.csv")}, "total_runtime_seconds": time.perf_counter() - t0}
-        write_json(output_root / "summary.json", summary)
-        return summary
-    finally:
-        if executor is not None:
-            executor.shutdown()
-
-
-USE_PARALLEL = True
-OUTPUT_ROOT = Path(__file__).resolve().parent / "output" / "numerical"
-RUN_SINGLE = True
-RUN_SENSITIVITY = True
-
-
-def run() -> None:
-    if RUN_SINGLE:
-        run_single(OUTPUT_ROOT / "single", USE_PARALLEL)
-    if RUN_SENSITIVITY:
-        run_sensitivity(OUTPUT_ROOT / "sensitivity", USE_PARALLEL)
-
-
-if __name__ == "__main__":
-    run()

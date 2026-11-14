@@ -1,7 +1,7 @@
 """Experiment 3: cost and demand-variance sensitivity, initialization 60/120."""
 from pathlib import Path
 
-from experiment_revision import OUTPUT_ROOT, run_point, single_params
+from experiment_common import OUTPUT_ROOT, run_point, single_params
 from numerical import write_csv
 
 
